@@ -19,9 +19,10 @@ sns.set()
 import mplfinance as mpf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
+import ollama
 # ML libs (original script)
 import random
+import json
 from datetime import datetime, timedelta
 import math
 import torch
@@ -714,6 +715,657 @@ def iterative_forecast_original(model, last_window_scaled, steps, feature_cols, 
     return preds_inv
 
 
+# Evolution Strategy Trading Agent Classes
+class DeepEvolutionStrategy:
+
+    def __init__(self, weights, reward_function,
+                 population_size=15,
+                 sigma=0.1,
+                 learning_rate=0.03):
+
+        self.weights = weights
+        self.reward_function = reward_function
+        self.population_size = population_size
+        self.sigma = sigma
+        self.learning_rate = learning_rate
+
+    def _get_weight_from_population(self, weights, population):
+
+        weights_population = []
+
+        for w, p in zip(weights, population):
+            weights_population.append(w + self.sigma * p)
+
+        return weights_population
+
+    def get_weights(self):
+        return self.weights
+
+    def train(self, epoch=120):
+
+        for _ in range(epoch):
+
+            population = []
+            rewards = np.zeros(self.population_size)
+
+            for k in range(self.population_size):
+
+                member = []
+                for w in self.weights:
+                    member.append(np.random.randn(*w.shape))
+
+                population.append(member)
+
+            for k in range(self.population_size):
+
+                weights = self._get_weight_from_population(self.weights, population[k])
+                rewards[k] = self.reward_function(weights)
+
+            rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-7)
+
+            for index, w in enumerate(self.weights):
+
+                A = np.array([p[index] for p in population])
+
+                grad = np.tensordot(rewards, A, axes=(0, 0)) / (self.population_size * self.sigma)
+
+                self.weights[index] = w + self.learning_rate * grad
+
+
+class ESModel:
+
+    def __init__(self, input_size, hidden_size, output_size):
+
+        self.weights = [
+            np.random.randn(input_size, hidden_size) * 0.1,
+            np.random.randn(hidden_size, output_size) * 0.1,
+            np.random.randn(1, hidden_size) * 0.1
+        ]
+
+    def predict(self, inputs):
+
+        W1, W2, b1 = self.weights
+
+        h = np.dot(inputs, W1) + b1
+        h = np.maximum(h, 0)
+
+        out = np.dot(h, W2)
+
+        return out
+
+    def get_weights(self):
+        return self.weights
+
+    def set_weights(self, weights):
+        self.weights = weights
+
+
+class ESAgent:
+
+    def __init__(self,
+                 model,
+                 window_size,
+                 forecast_series,
+                 actual_series,
+                 initial_money=10000):
+
+        self.model = model
+        self.window_size = window_size
+
+        self.forecast = forecast_series
+        self.actual = actual_series
+
+        self.initial_money = initial_money
+
+        self.es = DeepEvolutionStrategy(
+            self.model.get_weights(),
+            self.get_reward
+        )
+
+    def get_state(self, t):
+
+        window = self.window_size
+
+        d = t - window + 1
+
+        if d >= 0:
+            block = self.forecast[d:t+1]
+        else:
+            block = np.concatenate([
+                np.full(-d, self.forecast[0]),
+                self.forecast[0:t+1]
+            ])
+
+        res = [(block[i+1] - block[i]) for i in range(window - 1)]
+
+        return np.array([res])
+
+    def act(self, state):
+
+        decision = self.model.predict(state)
+
+        return np.argmax(decision[0])
+
+    def get_reward(self, weights):
+
+        self.model.set_weights(weights)
+
+        money = self.initial_money
+        inventory = []
+
+        state = self.get_state(0)
+
+        for t in range(len(self.forecast)-1):
+
+            action = self.act(state)
+
+            price = self.actual[t]
+
+            if action == 1 and money >= price:
+                inventory.append(price)
+                money -= price
+
+            elif action == 2 and len(inventory):
+
+                bought = inventory.pop(0)
+                money += price
+
+            state = self.get_state(t+1)
+
+        while len(inventory):
+
+            inventory.pop(0)
+            money += self.actual[-1]
+
+        return ((money - self.initial_money) / self.initial_money) * 100
+
+    def train(self):
+
+        self.es.train()
+
+    def trade(self):
+
+        self.model.set_weights(self.es.get_weights())
+
+        money = self.initial_money
+        inventory = []
+
+        buys = []
+        sells = []
+
+        cash_hist = []
+
+        state = self.get_state(0)
+
+        for t in range(len(self.forecast)-1):
+
+            action = self.act(state)
+
+            price = self.actual[t]
+
+            if action == 1 and money >= price:
+
+                inventory.append(price)
+                money -= price
+
+                buys.append(t)
+
+            elif action == 2 and len(inventory):
+
+                inventory.pop(0)
+                money += price
+
+                sells.append(t)
+
+            cash_hist.append(money)
+
+            state = self.get_state(t+1)
+
+        while len(inventory):
+
+            inventory.pop(0)
+            money += self.actual[-1]
+
+        total_gains = money - self.initial_money
+        pct_return = (total_gains / self.initial_money) * 100
+
+        return buys, sells, money, total_gains, pct_return, cash_hist
+
+
+def explain_model_performance_llm(mae_open, mae_close, rmse_open, rmse_close, test_days):
+
+    prompt = f"""
+A transformer-based stock forecasting model was evaluated on the last {test_days} days of data.
+
+Evaluation metrics obtained:
+
+MAE (Close Price): {mae_close:.4f} INR
+RMSE (Close Price): {rmse_close:.4f} INR
+
+Important clarification:
+• These errors represent absolute price differences in Indian Rupees (INR), NOT percentages.
+• For example, an MAE of {mae_close:.2f} means the prediction differs from the real price by about ₹{mae_close:.2f} on average.
+
+The forecasting model architecture:
+
+• Uses a 60-day historical input window of market data
+• Input projection converts indicators into a 128-dimension representation
+• Positional encoding preserves the chronological order of the sequence
+• A transformer encoder with 3 layers and 4 attention heads learns relationships across the 60-day window
+• A 2-layer transformer decoder interprets the learned market patterns
+• Final dense layers produce the predicted stock prices
+
+Explain the results in simple language.
+
+Focus on:
+• what MAE and RMSE represent in this context
+• how the model performed during the test period
+• how the 60-day transformer architecture helps capture market patterns
+• mention that small prediction differences are normal because financial markets are inherently volatile
+Focus on positives and do not state room for improvements keep optimistic and state how good model was.
+Do NOT convert these errors into percentages.
+Keep the explanation short (~10 lines) and neutral-professional in tone.
+"""
+
+    try:
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[
+                {
+                    "role":"system",
+                    "content":"You explain machine learning model performance clearly and professionally."
+                },
+                {
+                    "role":"user",
+                    "content":prompt
+                }
+            ],
+            options={"temperature":0.2, "num_predict":300},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"LLM explanation failed: {e}"
+    
+
+def explain_ig_results_llm(ticker):
+
+    try:
+        df = pd.read_csv(f"{ticker}_ig_summary_last10.csv")
+
+        top_features = (
+            df.groupby("feature")["score"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(8)
+            .to_string()
+        )
+
+        prompt = f"""
+Integrated Gradients (IG) was applied to explain a transformer-based stock prediction model.
+
+Model context:
+- Each prediction uses the **previous 60 days of market data**.
+- IG was calculated for the **last 10 prediction days**.
+- Each IG heatmap therefore shows how the **previous 60 days of features influenced that specific day's prediction**.
+
+Average IG feature importance across the 10 explanations:
+
+{top_features}
+
+Write a **concise analytical explanation** covering the following:
+
+1. Briefly explain what Integrated Gradients measures in this model (1 sentence only).
+
+2. Explain how to interpret the IG heatmap plots in this experiment:
+   - each plot corresponds to one prediction day
+   - x-axis represents the previous 60 days used as model input
+   - y-axis represents the indicators/features
+   - stronger red = stronger negative contribution
+   - stronger blue = stronger positive contribution.
+
+3. Analyze the **actual results above**:
+   - identify which indicators appear most influential
+   - explain why indicators such as Bollinger Bands, price values, or moving averages might matter for stock prediction.
+
+4. Provide a **clear interpretation of what the model has learned** from the data.
+
+5. Write 2–3 specific sentences that directly reference the most important indicators listed above.
+Explain:
+• what the dominance of these indicators suggests about the model's strategy
+• whether the model relies more on price levels, trend indicators (SMA/EMA), or volatility indicators (Bollinger Bands)
+• what this indicates about how the model predicts stock movement.
+
+Do not write a generic conclusion. The conclusion must mention at least two of the top indicators explicitly.
+
+Important instructions:
+- Do NOT write a generic textbook explanation.
+- Focus specifically on the **results provided above**.
+- Keep the explanation clear and analytical.
+- around 8–12 lines.
+"""
+
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":600},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"IG explanation failed: {e}"
+    
+
+def explain_saliency_results_llm(ticker):
+
+    try:
+        df = pd.read_csv(f"{ticker}_saliency_summary_last10.csv")
+
+        top_features = (
+            df.groupby("feature")["score"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(8)
+            .to_string()
+        )
+
+        prompt = f"""
+Saliency (gradient × input) analysis was applied to explain a transformer-based stock prediction model.
+
+Model context:
+- Each prediction uses the **previous 60 days of market data**.
+- Saliency was calculated for the **last 10 prediction days**.
+- Each saliency heatmap therefore shows how the **previous 60 days of features influenced that specific day's prediction**.
+
+Average saliency feature importance across the 10 explanations:
+
+{top_features}
+
+Write a **concise analytical explanation** covering the following:
+
+1. Briefly explain what Saliency (gradient × input) measures in this model (1 sentence only).
+
+2. Explain how to interpret the saliency heatmap plots in this experiment:
+   - each plot corresponds to one prediction day
+   - x-axis represents the previous 60 days used as model input
+   - y-axis represents the indicators/features
+   - stronger red = stronger negative contribution
+   - stronger blue = stronger positive contribution.
+
+3. Analyze the **actual results above**:
+   - identify which indicators appear most influential
+   - explain why indicators such as Bollinger Bands, price values, or moving averages might matter for stock prediction.
+
+4. Provide a **clear interpretation of what the model has learned** from the data.
+
+5. Write 2–3 specific sentences that directly reference the most important indicators listed above.
+Explain:
+• what the dominance of these indicators suggests about the model's strategy
+• whether the model relies more on price levels, trend indicators (SMA/EMA), or volatility indicators (Bollinger Bands)
+• what this indicates about how the model predicts stock movement.
+
+Do not write a generic conclusion. The conclusion must mention at least two of the top indicators explicitly.
+
+Important instructions:
+- Do NOT write a generic textbook explanation.
+- Focus specifically on the **results provided above**.
+- Keep the explanation clear and analytical.
+- around 8–12 lines.
+"""
+
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":600},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"Saliency explanation failed: {e}"
+    
+
+def explain_permutation_results_llm(ticker):
+
+    try:
+        df = pd.read_csv(f"{ticker}_permutation_importance.csv")
+
+        top_features = df.head(8).to_string()
+
+        prompt = f"""
+Permutation feature importance was applied to explain a transformer-based stock prediction model.
+
+Model context:
+- The model predicts stock prices using multiple technical indicators.
+- Permutation importance measures how prediction accuracy changes when each feature is randomly shuffled.
+- A larger increase in RMSE means that feature is more important for the model.
+
+Top features based on permutation importance:
+
+{top_features}
+
+Write a **concise analytical explanation** covering the following:
+
+1. Briefly explain what permutation importance measures in this model (1 sentence only).
+
+2. Explain how to interpret the permutation importance bar plot:
+   - each bar represents one feature
+   - the x-axis represents the increase in RMSE after shuffling that feature
+   - larger RMSE increase means the model depends more on that feature.
+
+3. Analyze the **actual results above**:
+   - identify which indicators appear most influential
+   - explain why indicators such as Bollinger Bands, price values, or moving averages might matter for stock prediction.
+
+4. Provide a **clear interpretation of what the model has learned** from the data.
+
+5. Write 2–3 specific sentences that directly reference the most important indicators listed above.
+Explain:
+• what the dominance of these indicators suggests about the model's strategy
+• whether the model relies more on price levels, trend indicators (SMA/EMA), or volatility indicators (Bollinger Bands)
+• what this indicates about how the model predicts stock movement.
+
+Do not write a generic conclusion. The conclusion must mention at least two of the top indicators explicitly.
+
+Important instructions:
+- Do NOT write a generic textbook explanation.
+- Focus specifically on the **results provided above**.
+- Keep the explanation clear and analytical.
+- around 8–12 lines.
+"""
+
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":600},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"Permutation explanation failed: {e}"
+    
+
+def explain_shap_results_llm(ticker):
+
+    try:
+        df = pd.read_csv(f"{ticker}_shap_explained_last10.csv")
+
+        top_features = (
+            df.groupby("feature")["shap"]
+            .apply(lambda x: abs(x).mean())
+            .sort_values(ascending=False)
+            .head(8)
+            .to_string()
+        )
+
+        prompt = f"""
+SHAP (SHapley Additive Explanations) analysis was applied to explain a transformer-based stock prediction model.
+
+Model context:
+- Each prediction uses the **previous 60 days of market data**.
+- SHAP values were computed for the **last 10 prediction days**.
+- SHAP measures how much each feature contributes positively or negatively to a prediction.
+
+Average SHAP feature importance across the 10 explanations:
+
+{top_features}
+
+Write a **concise analytical explanation** covering the following:
+
+1. Briefly explain what SHAP values measure in this model (1 sentence only).
+
+2. Explain how to interpret the SHAP plots:
+   - each plot corresponds to one prediction day
+   - features push predictions either higher or lower
+   - positive SHAP values increase predictions
+   - negative SHAP values decrease predictions.
+
+3. Analyze the **actual results above**:
+   - identify which indicators appear most influential
+   - explain why indicators such as Bollinger Bands, price values, or moving averages might matter for stock prediction.
+
+4. Provide a **clear interpretation of what the model has learned** from the data.
+
+5. Write 2–3 specific sentences that directly reference the most important indicators listed above.
+Explain:
+• what the dominance of these indicators suggests about the model's strategy
+• whether the model relies more on price levels, trend indicators (SMA/EMA), or volatility indicators (Bollinger Bands)
+• what this indicates about how the model predicts stock movement.
+
+Do not write a generic conclusion. The conclusion must mention at least two of the top indicators explicitly.
+
+Important instructions:
+- Do NOT write a generic textbook explanation.
+- Focus specifically on the **results provided above**.
+- Keep the explanation clear and analytical.
+- around 8–12 lines.
+"""
+
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":600},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"SHAP explanation failed: {e}"
+
+
+def explain_combined_xai_llm(ig_summary, saliency_summary, permutation_summary, shap_summary):
+
+    prompt = f"""
+Multiple explainability techniques were used to analyze a transformer-based stock forecasting model.
+
+Below are the summaries from each technique:
+
+Integrated Gradients Summary:
+{ig_summary}
+
+Saliency Summary:
+{saliency_summary}
+
+Permutation Importance Summary:
+{permutation_summary}
+
+SHAP Summary:
+{shap_summary}
+
+Write a **combined analytical interpretation** covering the following:
+
+1. Identify which indicators appear consistently important across multiple methods.
+2. Explain what this consistency suggests about the model's decision-making process.
+3. Discuss whether the model relies more on:
+   - price levels (Open, High, Low, Close)
+   - trend indicators (SMA, EMA)
+   - volatility indicators (Bollinger Bands)
+   - momentum indicators (Stochastic, RSI).
+
+4. Explain what this tells us about the strategy the model has learned for predicting stock prices.
+
+5. Provide a clear final conclusion about how the model uses technical indicators when making predictions.
+
+Important instructions:
+- Do NOT repeat textbook definitions of the XAI techniques.
+- Focus on **comparing the results across methods**.
+- The explanation must reference **specific indicators appearing in the summaries above**.
+- Avoid vague language.
+- Write about **8–12 analytical lines**.
+"""
+
+    try:
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":700},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"Combined XAI explanation failed: {e}"
+
+
+def explain_future_forecast_llm(pred_prices,pct):
+
+    start_price = float(pred_prices[0])
+    end_price = float(pred_prices[-1])
+    pct_change = ((end_price - start_price) / start_price) * 100
+
+    if pct_change > 2:
+        trend = "increase"
+    elif pct_change < -2:
+        trend = "decrease"
+    else:
+        trend = "remain relatively stable"
+
+    prompt = f"""
+The stock forecasting model has been retrained on the full historical dataset.
+
+The model then generated a **45 day future price forecast**.
+
+Forecast statistics:
+
+Starting predicted price: {start_price:.2f}
+Ending predicted price: {end_price:.2f}
+Percentage change over forecast horizon: {pct:.2f}%
+
+Explain the expected price trend.
+
+Focus on:
+• whether the price is expected to rise, fall, or stay relatively stable
+• what the predicted percentage change indicates and sould user buy or sell stocks presently
+• mention that the forecast is based on historical market patterns learned by the model
+
+Keep the explanation concise (~5 sentences).
+Do not be overly technical.
+"""
+
+    try:
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[{"role":"user","content":prompt}],
+            options={"temperature":0.2,"num_predict":400},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"Forecast explanation failed: {e}"
+    
+
+
 # Training and evaluation 
 def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
     """
@@ -883,14 +1535,26 @@ def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
         mae_close = mean_absolute_error(targets_inv[:,1], preds_inv[:,1])
 
         st.write(f"Test MAE  Open: {mae_open:.4f} | Close: {mae_close:.4f}")
-
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=test_dates, y=targets_inv[:,1], name="Actual Close"))
         fig.add_trace(go.Scatter(x=test_dates, y=preds_inv[:,1], name="Pred Close", line=dict(dash="dash")))
         fig.update_layout(title=f"{ticker} — Test: Close price Actual vs Predicted | RMSE={rmse_close:.3f} MAE={mae_close:.3f}",
                           xaxis_title="Date", yaxis_title="Close")
         st.plotly_chart(fig, use_container_width=True)
+        st.markdown("### AI Explanation of Model Performance")
 
+        with st.spinner("AI analyzing model performance..."):
+            model_explanation = explain_model_performance_llm(
+                mae_open,
+                mae_close,
+                rmse_open,
+                rmse_close,
+                TEST_DAYS
+            )
+
+        st.write(model_explanation)
+
+    
         # XAI POST-EVAL 
         # Uses Captum (IG, Saliency), permutation importance, and SHAP.
         st.markdown("## Model Explainability (XAI) — Test set (last 10 test dates)")
@@ -1030,6 +1694,10 @@ def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
             if ig_summary_rows:
                 pd.DataFrame(ig_summary_rows).to_csv(f"{ticker}_ig_summary_last10.csv", index=False)
                 st.info(f"Saved IG summary to `{ticker}_ig_summary_last10.csv`")
+                st.markdown("### AI Summary of Integrated Gradients")
+                with st.spinner("AI analyzing IG results..."):
+                    ig_summary = explain_ig_results_llm(ticker)
+                st.write(ig_summary)
         else:
             st.info("Captum not available — skipping Integrated Gradients.")
 
@@ -1102,6 +1770,10 @@ def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
             if sal_summary_rows:
                 pd.DataFrame(sal_summary_rows).to_csv(f"{ticker}_saliency_summary_last10.csv", index=False)
                 st.info(f"Saved saliency summary to `{ticker}_saliency_summary_last10.csv`")
+                st.markdown("### AI Summary of Saliency Analysis")
+                with st.spinner("AI analyzing saliency results..."):
+                    sal_summary = explain_saliency_results_llm(ticker)
+                st.write(sal_summary)
         else:
             st.info("Captum not available — skipping Saliency.")
 
@@ -1146,6 +1818,10 @@ def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
             st.plotly_chart(perm_fig, use_container_width=True)
             perm_df.to_csv(f"{ticker}_permutation_importance.csv", index=False)
             st.info(f"Saved permutation importances to `{ticker}_permutation_importance.csv`")
+            st.markdown("### AI Summary of Permutation Importance")
+            with st.spinner("AI analyzing Permutation results..."):
+                per_summary = explain_permutation_results_llm(ticker)
+            st.write(per_summary)    
         except Exception as e:
             st.warning(f"Permutation importance failed: {e}")
 
@@ -1201,13 +1877,28 @@ def train_and_eval_informer_from_df(df: pd.DataFrame, ticker: str):
                 if shap_rows:
                     pd.DataFrame(shap_rows).to_csv(f"{ticker}_shap_explained_last10.csv", index=False)
                     st.info(f"Saved SHAP results to `{ticker}_shap_explained_last10.csv`")
+                    st.markdown("### AI Summary of SHAP Analysis")
+                    with st.spinner("AI analyzing SHAP results..."):
+                        shap_summary = explain_shap_results_llm(ticker)
+                    st.write(shap_summary)
             except Exception as e:
                 st.warning(f"SHAP explanation failed: {e}")
         else:
             st.info("SHAP not available — skipping SHAP explanations. Install `shap` to enable.")
 
         st.success("XAI run complete for last test dates. Check CSV artifacts saved alongside the app for deeper analysis.")
-        
+        st.markdown("### Combined AI Interpretation of Model Behaviour")
+
+        with st.spinner("AI comparing results across XAI techniques..."):
+            combined_xai = explain_combined_xai_llm(
+                ig_summary,
+                sal_summary,
+                per_summary,
+                shap_summary
+            )
+        st.write(combined_xai)
+
+
 
     # Forecast next 365 days and interactive Plotly
         try:
@@ -1364,6 +2055,68 @@ def show_auth():
         else:
             st.info("If you don't have an account, click **New user? Sign up** on the left.")
 
+def explain_indicators_llm():
+
+    prompt = """
+Explain the following stock technical indicators in very simple language.
+Give only 1–2 short sentences for each indicator.
+
+Dataset columns used by the model:
+
+Price Data
+Open – Opening price of the stock for the day.
+High – Highest traded price during the day.
+Low – Lowest traded price during the day.
+Close – Final traded price of the day.
+Volume – Total number of shares traded.
+Dividends – Dividend issued on that date.
+Stock Splits – Stock split adjustment factor.
+
+Trend Indicators
+SMA_20 – 20-day Simple Moving Average showing overall price trend.
+EMA_20 – 20-day Exponential Moving Average giving more weight to recent prices.
+EMA_50 – 50-day Exponential Moving Average used for longer trend direction.
+
+MACD Indicators
+MACD_12_26_9 – Difference between 12-EMA and 26-EMA measuring momentum.
+MACDh_12_26_9 – MACD histogram showing distance between MACD and signal line.
+MACDs_12_26_9 – Signal line (9-period EMA of MACD) used for trend signals.
+
+Momentum Indicators
+RSI_14 – Relative Strength Index (0-100). Above 70 = overbought, below 30 = oversold.
+STOCHk_14_3_3 – Fast stochastic %K measuring position of close within recent range.
+STOCHd_14_3_3 – Smoothed stochastic %D used for trading signals.
+STOCHh_14_3_3 – Difference between %K and %D indicating momentum shifts.
+
+Volatility Indicators
+BBL_20_2.0_2.0 – Lower Bollinger Band showing lower volatility boundary.
+BBM_20_2.0_2.0 – Middle Bollinger Band (20-day moving average).
+BBU_20_2.0_2.0 – Upper Bollinger Band showing upper volatility boundary.
+BBB_20_2.0_2.0 – Bollinger Band width measuring market volatility.
+BBP_20_2.0_2.0 – Bollinger Band percentage showing price position within bands.
+
+ATR_14 – Average True Range measuring market volatility.
+
+Volume Indicator
+OBV – On Balance Volume tracking buying and selling pressure using volume flow.
+"""
+
+    try:
+        response = ollama.chat(
+            model="gemma2:2b",
+            messages=[
+                {"role":"system","content":"You are a financial assistant. Explain technical indicators simply. do not add things like sure here is the explanation or how can i help you next. just explain what is said and then stop."},
+                {"role":"user","content":prompt}
+            ],
+            options={"temperature":0.2, "num_predict":700},
+            keep_alive="30m"
+        )
+
+        return response["message"]["content"]
+
+    except Exception as e:
+        return f"LLM explanation failed: {e}"
+
 def show_dashboard():
     st.markdown(
         "<div style='display:flex; justify-content:space-between; align-items:center;'>"
@@ -1406,11 +2159,21 @@ def show_dashboard():
                 raw_df[c] = pd.to_numeric(raw_df[c], errors="coerce")
 
             df_with_ind = add_indicators(raw_df)
+            with open("latest_run.json", "w") as f:
+                json.dump({"ticker": tick}, f)
+
             out_csv = f"{tick}_with_indicators.csv"
             df_with_ind.to_csv(out_csv, index=True)
             st.success(f"Indicators computed and saved to `{out_csv}` ({len(df_with_ind)} rows).")
             st.markdown("### Data with Technical Indicators (last 5 rows)")
             st.dataframe(df_with_ind.tail(5))
+            # LLM explanation of indicators
+            st.markdown("## AI Explanation of Technical Indicators")
+
+            with st.spinner("Generating simple explanations..."):
+                explanation = explain_indicators_llm()
+
+            st.write(explanation)
 
             # interactive charts
             st.markdown("## Interactive Charts")
@@ -1463,154 +2226,90 @@ def show_dashboard():
                             test_dates_arr = pd.to_datetime(test_dates)
                         except Exception:
                             test_dates_arr = np.arange(N_test)
-
                         
-                        # AB=CD Signal generator
-                        def abcd_signal_from_series(close_series, skip_loop=4, ma_window=7):
-                            arr = np.asarray(close_series, dtype=float)
-                            if len(arr) < ma_window + 4:
-                                return np.zeros(len(arr), dtype=float)
-                            ma = pd.Series(arr).rolling(ma_window, min_periods=1).mean().values
-                            x = []
-                            L = len(ma)
-                            for a in range(0, L):
-                                for b in range(a + 1, L, skip_loop):
-                                    for c in range(b + 1, L, skip_loop):
-                                        for d in range(c + 1, L, skip_loop):
-                                            if (ma[b] > ma[a]) and (ma[c] < ma[b] and ma[c] > ma[a]) and (ma[d] > ma[b]):
-                                                x.append((a, b, c, d))
-                            if len(x) == 0:
-                                return np.zeros(len(arr), dtype=float)
-                            x_np = np.array(x)
-                            ac = x_np[:, 0].tolist() + x_np[:, 2].tolist()
-                            bd = x_np[:, 1].tolist() + x_np[:, 3].tolist()
-                            ac_set = set(ac)
-                            bd_set = set(bd)
-                            signal = np.zeros(len(arr), dtype=float)
-                            buy_idxs = sorted(list(ac_set - bd_set))
-                            sell_idxs = sorted(list(bd_set - ac_set))
-                            buy_idxs = [i for i in buy_idxs if 0 <= i < len(arr)]
-                            sell_idxs = [i for i in sell_idxs if 0 <= i < len(arr)]
-                            signal[buy_idxs] = 1.0
-                            signal[sell_idxs] = -1.0
-                            return signal
-
-                        
-                        # Execute trades using actual execution prices
-                        def execute_trades(real_prices, signal, initial_money=10000.0, max_buy=1, max_sell=1):
-                            rp = np.asarray(real_prices, dtype=float)
-                            sig = np.asarray(signal, dtype=float)
-                            if len(rp) != len(sig):
-                                raise ValueError("real_prices and signal must have same length.")
-                            cash = float(initial_money)
-                            inventory = []
-                            buys = []
-                            sells = []
-                            cash_history = []
-                            for i in range(len(rp)):
-                                s = sig[i]
-                                price = float(rp[i])
-                                if s == 1.0:
-                                    if price <= 0:
-                                        cash_history.append(cash)
-                                        continue
-                                    affordable = int(cash // price)
-                                    if affordable < 1:
-                                        cash_history.append(cash)
-                                        continue
-                                    buy_units = min(max_buy, affordable)
-                                    cash -= buy_units * price
-                                    for _ in range(buy_units):
-                                        inventory.append(price)
-                                    buys.append(i)
-                                elif s == -1.0:
-                                    if len(inventory) == 0:
-                                        cash_history.append(cash)
-                                        continue
-                                    sell_units = min(max_sell, len(inventory))
-                                    for _ in range(sell_units):
-                                        bought_price = inventory.pop(0)
-                                    cash += sell_units * price
-                                    sells.append(i)
-                                cash_history.append(cash)
-                            # Close any leftover inventory at last price
-                            if len(inventory) > 0:
-                                last_price = float(rp[-1])
-                                while inventory:
-                                    inventory.pop(0)
-                                    cash += last_price
-                            total_gains = cash - float(initial_money)
-                            pct_return = (total_gains / float(initial_money)) * 100.0
-                            return buys, sells, cash, total_gains, pct_return, cash_history
-
-                        
-                        sig = abcd_signal_from_series(forecast_close, skip_loop=4, ma_window=7)
-                        st.write("Signal distribution on forecasted closes (value:count):", np.unique(sig, return_counts=True))
-
-                        # Execute trades on actual close prices 
-                        INITIAL_MONEY = 10000.0
-                        MAX_BUY = 1
-                        MAX_SELL = 1
-                        buys, sells, final_cash, total_gains, pct_return, cash_hist = execute_trades(
-                            real_prices=actual_close,
-                            signal=sig,
-                            initial_money=INITIAL_MONEY,
-                            max_buy=MAX_BUY,
-                            max_sell=MAX_SELL
+                        # ES Strategy execution
+                        forecast_close = np.asarray(preds_inv[:,1])
+                        actual_close = np.asarray(targets_inv[:,1])
+                        window_size = 30
+                        es_model = ESModel(
+                            input_size=window_size-1,
+                            hidden_size=64,
+                            output_size=3
                         )
 
-                        # Buy-and-hold baseline on the same test window
-                        if len(actual_close) > 0 and actual_close[0] > 0:
-                            start_price = float(actual_close[0])
-                            units = int(INITIAL_MONEY // start_price)
-                            leftover = INITIAL_MONEY - units * start_price
-                            final_bh = leftover + units * float(actual_close[-1])
-                            bh_return_pct = ((final_bh - INITIAL_MONEY) / INITIAL_MONEY) * 100.0
-                        else:
-                            final_bh = INITIAL_MONEY
-                            bh_return_pct = 0.0
+                        agent = ESAgent(
+                            model=es_model,
+                            window_size=window_size,
+                            forecast_series=forecast_close,
+                            actual_series=actual_close,
+                            initial_money=10000
+                        )
 
-                        # Show a summary
-                        st.markdown("### AB=CD Strategy Results on Test Set")
-                        st.write(f"Trades -> buys: {len(buys)} sells: {len(sells)}")
-                        st.write(f"Agent final cash: {final_cash:.2f} | Total gains: {total_gains:.2f} | Return: {pct_return:.2f}%")
-                        st.write(f"Buy-and-hold final cash: {final_bh:.2f} | Return: {bh_return_pct:.2f}%")
+                        agent.train()
 
+                        buys, sells, final_cash, total_gains, pct_return, cash_hist = agent.trade()
+
+                        INITIAL_MONEY = 10000
+                        st.markdown("### ES Strategy Results on Test Set")
+
+                        st.write(f"Trades → buys: {len(buys)} sells: {len(sells)}")
+
+                        st.write(
+                            f"Agent final cash: {final_cash:.2f} | "
+                            f"Total gains: {total_gains:.2f} | "
+                            f"Return: {pct_return:.2f}%"
+                        )
                         
-                        # actual vs forecast with buy/sell markers
-                        pfig = go.Figure()
-                        # Actual Close 
-                        pfig.add_trace(go.Scatter(x=test_dates_arr, y=actual_close, name="Actual Close (execution)", mode="lines", line=dict(width=2)))
-                        # Forecast Close 
-                        pfig.add_trace(go.Scatter(x=test_dates_arr, y=forecast_close, name="Forecast Close (agent view)", mode="lines", line=dict(dash="dash")))
-                        # Buys
-                        if len(buys):
-                            pfig.add_trace(go.Scatter(
+                        # Plot cash history
+                        # ----------------------------------------------------------
+                        # ES Trade Execution Chart (Buy / Sell markers)
+                        # ----------------------------------------------------------
+
+                        trade_fig = go.Figure()
+
+                        # Actual price line
+                        trade_fig.add_trace(go.Scatter(
+                            x=test_dates_arr,
+                            y=actual_close,
+                            name="Actual Close",
+                            mode="lines",
+                            line=dict(width=2)
+                        ))
+
+                        # Buy markers
+                        if len(buys) > 0:
+                            trade_fig.add_trace(go.Scatter(
                                 x=[test_dates_arr[i] for i in buys],
-                                y=actual_close[buys],
+                                y=[actual_close[i] for i in buys],
                                 mode="markers",
                                 marker=dict(symbol="triangle-up", size=12, color="green"),
-                                name="Buy (executed)"
+                                name="Buy Signal"
                             ))
-                        # Sells
-                        if len(sells):
-                            pfig.add_trace(go.Scatter(
+
+                        # Sell markers
+                        if len(sells) > 0:
+                            trade_fig.add_trace(go.Scatter(
                                 x=[test_dates_arr[i] for i in sells],
-                                y=actual_close[sells],
+                                y=[actual_close[i] for i in sells],
                                 mode="markers",
                                 marker=dict(symbol="triangle-down", size=12, color="red"),
-                                name="Sell (executed)"
+                                name="Sell Signal"
                             ))
 
-                        pfig.update_layout(title=f"{tick} — AB=CD trades on test set (return {pct_return:.2f}%, B&H {bh_return_pct:.2f}%)",
-                                           xaxis_title="Date", yaxis_title="Price", legend=dict(orientation="h"), height=540)
-                        st.plotly_chart(pfig, use_container_width=True)
+                        trade_fig.update_layout(
+                            title=f"{tick} — ES Strategy Trades on Test Set",
+                            xaxis_title="Date",
+                            yaxis_title="Price",
+                            legend=dict(orientation="h"),
+                            height=540
+                        )
 
-                        # Plot cash history
+                        st.plotly_chart(trade_fig, use_container_width=True)
                         ch_fig = go.Figure()
                         ch_fig.add_trace(go.Scatter(x=test_dates_arr, y=cash_hist, name="Cash over time", mode="lines+markers"))
                         ch_fig.update_layout(title="Cash history while trading", xaxis_title="Date", yaxis_title="Cash", height=380)
                         st.plotly_chart(ch_fig, use_container_width=True)
+                        
                         
                         st.markdown("### Next 45-day Forecast & Recommendation ")
                         try:
@@ -1627,6 +2326,7 @@ def show_dashboard():
                             future_steps = 45
                             preds_future_inv = iterative_forecast_original(model, last_window_scaled,
                                                                            future_steps, feature_cols, target_cols, scaler)
+                            future_close_prices = preds_future_inv[:,1]
                             last_date = df_with_ind.index[-1]
                             if isinstance(last_date, pd.Timestamp) and last_date.tz is not None:
                                 future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1),
@@ -1662,6 +2362,13 @@ def show_dashboard():
 
                             st.write(f"Last actual close: {last_actual_close:.2f}")
                             st.write(f"Mean predicted close (next {future_steps} days): {mean_future:.2f} ({pct_change:.2f}% change)")
+                            forecast_df = pd.DataFrame({
+                                "ticker":[tick],
+                                "last_close":[last_actual_close],
+                                "mean_future_close":[mean_future],
+                                "pct_change":[pct_change]
+                            })
+                            forecast_df.to_csv(f"{tick}_forecast_summary.csv", index=False)
                             st.markdown(f"**Recommendation: {rec}** — (thresholds: BUY >= +{BUY_TH}%, SELL <= {SELL_TH}%)")
 
                             
@@ -1681,6 +2388,33 @@ def show_dashboard():
                             fut_fig.update_layout(title=f"{tick} — Forecast Close next {future_steps} days (Recommendation: {rec})",
                                                   xaxis_title="Date", yaxis_title="Price", height=540)
                             st.plotly_chart(fut_fig, use_container_width=True)
+                            st.markdown("### AI Explanation of Future Forecast")
+
+                            with st.spinner("AI analyzing predicted trend..."):
+                                forecast_summary = explain_future_forecast_llm(future_close_prices,pct_change)
+
+                            st.write(forecast_summary)
+
+                            st.markdown("## AI Financial Assistant")
+
+                            st.markdown(
+"""
+Ask questions about:
+
+• Technical indicators  
+• Model accuracy (MAE / RMSE)  
+• Explainable AI results (IG, Saliency, SHAP, Permutation)  
+• Forecast interpretation  
+
+"""
+                            )
+
+                            st.link_button(
+                                "Open AI Chatbot",
+                                "http://localhost:8502"
+                            )
+
+                            
 
                 except Exception as e:
                     st.warning(f"AB=CD agent or future recommendation failed: {e}")
