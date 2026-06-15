@@ -30,7 +30,7 @@ The project was developed as a **B.Tech Final Year Project at Jaypee Institute o
 
 # 🎥 Demo
 
-A complete demonstration of the application is available in the demo video
+A complete demonstration of the application is available in the demo video: https://github.com/devag2004/AI-stock-Advisor-using-eXplainable-AI/tree/main/AI stock advisor demo.mp4
 
 
 
